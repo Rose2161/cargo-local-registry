@@ -4,9 +4,9 @@ use cargo::core::resolver::Resolve;
 use cargo::core::{Package, SourceId, Workspace};
 use cargo::sources::PathSource;
 use cargo::util::errors::*;
-use cargo::util::Config;
+use cargo::util::GlobalContext;
 use cargo_platform::Platform;
-use docopt::Docopt;
+use clap::Parser as _;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -18,16 +18,32 @@ use std::path::{self, Path, PathBuf};
 use tar::{Builder, Header};
 use url::Url;
 
-#[derive(Deserialize)]
+#[derive(clap::Parser)]
+#[command(version, about)]
 struct Options {
-    arg_path: String,
-    flag_no_delete: Option<bool>,
-    flag_sync: Option<String>,
-    flag_host: Option<String>,
-    flag_verbose: u32,
-    flag_quiet: bool,
-    flag_color: Option<String>,
-    flag_git: bool,
+    /// Sync the registry with LOCK
+    #[arg(short, long)]
+    sync: Option<String>,
+    /// Registry index to sync with
+    #[arg(long)]
+    host: Option<String>,
+    /// Vendor git dependencies as well
+    #[arg(long, default_value_t = false)]
+    git: bool,
+    /// Use verbose output
+    #[arg(short, long, default_value_t)]
+    verbose: u32,
+    /// No output printed to stdout
+    #[arg(short, long, default_value_t = false)]
+    quiet: bool,
+    /// Coloring: auto, always, never
+    #[arg(short, long)]
+    color: Option<String>,
+    /// Don't delete older crates in the local registry directory
+    #[arg(long)]
+    no_delete: Option<bool>,
+
+    path: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -60,45 +76,26 @@ fn main() {
     // intended for other consumers of Cargo, but we want to go straight to the
     // source, e.g. crates.io, to fetch crates.
     let mut config = {
-        let config_orig = Config::default().unwrap();
+        let config_orig = GlobalContext::default().unwrap();
         let mut values = config_orig.values().unwrap().clone();
         values.remove("source");
-        let config = Config::default().unwrap();
+        let config = GlobalContext::default().unwrap();
         config.set_values(values).unwrap();
         config
     };
 
-    let usage = r#"
-Vendor all dependencies for a project locally
-
-Usage:
-    cargo local-registry [options] [<path>]
-
-Options:
-    -h, --help               Print this message
-    -s, --sync LOCK          Sync the registry with LOCK
-    --host HOST              Registry index to sync with
-    --git                    Vendor git dependencies as well
-    -v, --verbose            Use verbose output
-    -q, --quiet              No output printed to stdout
-    --color WHEN             Coloring: auto, always, never
-    --no-delete              Don't delete older crates in the local registry directory
-"#;
-
-    let options = Docopt::new(usage)
-        .and_then(|d| d.deserialize())
-        .unwrap_or_else(|e| e.exit());
+    let options = Options::parse();
     let result = real_main(options, &mut config);
     if let Err(e) = result {
-        cargo::exit_with_error(e.into(), &mut *config.shell());
+        cargo::exit_with_error(e.into(), &mut config.shell());
     }
 }
 
-fn real_main(options: Options, config: &mut Config) -> CargoResult<()> {
+fn real_main(options: Options, config: &mut GlobalContext) -> CargoResult<()> {
     config.configure(
-        options.flag_verbose,
-        options.flag_quiet,
-        options.flag_color.as_deref(),
+        options.verbose,
+        options.quiet,
+        options.color.as_deref(),
         /* frozen = */ false,
         /* locked = */ false,
         /* offline = */ false,
@@ -107,22 +104,22 @@ fn real_main(options: Options, config: &mut Config) -> CargoResult<()> {
         /* cli_config = */ &[],
     )?;
 
-    let path = Path::new(&options.arg_path);
+    let path = Path::new(&options.path);
     let index = path.join("index");
 
     fs::create_dir_all(&index)
         .with_context(|| format!("failed to create index: `{}`", index.display()))?;
-    let id = match options.flag_host {
+    let id = match options.host {
         Some(ref s) => SourceId::for_registry(&Url::parse(s)?)?,
         None => SourceId::crates_io_maybe_sparse_http(config)?,
     };
 
-    let lockfile = match options.flag_sync {
+    let lockfile = match options.sync {
         Some(ref file) => file,
         None => return Ok(()),
     };
 
-    sync(Path::new(lockfile), &path, &id, &options, config).with_context(|| "failed to sync")?;
+    sync(Path::new(lockfile), path, &id, &options, config).with_context(|| "failed to sync")?;
 
     println!(
         "add this to your .cargo/config somewhere:
@@ -147,9 +144,9 @@ fn sync(
     local_dst: &Path,
     registry_id: &SourceId,
     options: &Options,
-    config: &Config,
+    config: &GlobalContext,
 ) -> CargoResult<()> {
-    let no_delete = options.flag_no_delete.unwrap_or(false);
+    let no_delete = options.no_delete.unwrap_or(false);
     let canonical_local_dst = local_dst.canonicalize().unwrap_or(local_dst.to_path_buf());
     let manifest = lockfile.parent().unwrap().join("Cargo.toml");
     let manifest = env::current_dir().unwrap().join(&manifest);
@@ -168,7 +165,7 @@ fn sync(
     let mut added_index = HashSet::new();
     for id in resolve.iter() {
         if id.source_id().is_git() {
-            if !options.flag_git {
+            if !options.git {
                 continue;
             }
         } else if !id.source_id().is_registry() {
@@ -190,7 +187,7 @@ fn sync(
             let gz = GzEncoder::new(file, flate2::Compression::best());
             let mut ar = Builder::new(gz);
             ar.mode(tar::HeaderMode::Deterministic);
-            build_ar(&mut ar, &pkg, config);
+            build_ar(&mut ar, pkg, config);
         }
         added_crates.insert(dst);
 
@@ -202,11 +199,11 @@ fn sync(
             3 => index_dir.join("3").join(&name[..1]).join(name),
             _ => index_dir.join(&name[..2]).join(&name[2..4]).join(name),
         };
-        fs::create_dir_all(&dst.parent().unwrap())?;
-        let line = serde_json::to_string(&registry_pkg(&pkg, &resolve)).unwrap();
+        fs::create_dir_all(dst.parent().unwrap())?;
+        let line = serde_json::to_string(&registry_pkg(pkg, &resolve)).unwrap();
 
         let prev = if no_delete || added_index.contains(&dst) {
-            read(&dst).unwrap_or(String::new())
+            read(&dst).unwrap_or_default()
         } else {
             // If cleaning old entries (no_delete is not set), don't read the file unless we wrote
             // it in one of the previous iterations.
@@ -255,12 +252,10 @@ fn sync(
 
 fn scan_delete(path: &Path, depth: usize, keep: &HashSet<PathBuf>) -> CargoResult<()> {
     if path.is_file() && !keep.contains(path) {
-        fs::remove_file(&path)?;
+        fs::remove_file(path)?;
     } else if path.is_dir() && depth > 0 {
-        for entry in path.read_dir()? {
-            if let Ok(entry) = entry {
-                scan_delete(&entry.path(), depth - 1, keep)?;
-            }
+        for entry in (path.read_dir()?).flatten() {
+            scan_delete(&entry.path(), depth - 1, keep)?;
         }
 
         let is_empty = path.read_dir()?.next().is_none();
@@ -272,11 +267,11 @@ fn scan_delete(path: &Path, depth: usize, keep: &HashSet<PathBuf>) -> CargoResul
     Ok(())
 }
 
-fn build_ar(ar: &mut Builder<GzEncoder<File>>, pkg: &Package, config: &Config) {
+fn build_ar(ar: &mut Builder<GzEncoder<File>>, pkg: &Package, config: &GlobalContext) {
     let root = pkg.root();
     let src = PathSource::new(pkg.root(), pkg.package_id().source_id(), config);
     for file in src.list_files(pkg).unwrap().iter() {
-        let relative = file.strip_prefix(&root).unwrap();
+        let relative = file.strip_prefix(root).unwrap();
         let relative = relative.to_str().unwrap();
         let mut file = File::open(file).unwrap();
         let path = format!(
@@ -332,22 +327,19 @@ fn registry_pkg(pkg: &Package, resolve: &Resolve) -> RegistryPackage {
     let features = pkg
         .summary()
         .features()
-        .into_iter()
-        .filter_map(|(k, v)| {
-            let mut v = v
-                .iter()
-                .filter_map(|fv| Some(fv.to_string()))
-                .collect::<Vec<_>>();
+        .iter()
+        .map(|(k, v)| {
+            let mut v = v.iter().map(|fv| fv.to_string()).collect::<Vec<_>>();
             v.sort();
-            Some((k.to_string(), v))
+            (k.to_string(), v)
         })
         .collect();
 
     RegistryPackage {
         name: id.name().to_string(),
         vers: id.version().to_string(),
-        deps: deps,
-        features: features,
+        deps,
+        features,
         cksum: resolve
             .checksums()
             .get(&id)
